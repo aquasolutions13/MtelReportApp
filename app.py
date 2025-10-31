@@ -1,790 +1,776 @@
-# app.py — Google Drive storage varijanta (pydrive2)
+# app.py — Analiza prodaje Austrija (Google Drive)
+# Razvijeno od strane *gennaro* ✨
+
+import io
 import os
 import re
-import io
-import zipfile
+import json
 import tempfile
 from datetime import datetime
+from typing import List, Tuple, Optional
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# =============== GDRIVE STORAGE (upload/list/read) ===============
-# U Streamlit Cloud -> Settings -> Secrets dodaj:
-# [gdrive]
-# FOLDER_ID = "xxxxxxxxxxxxxxxxxxxxxxxx"   # ID tvog Drive foldera
-# SERVICE_ACCOUNT_JSON = """{ ... kompletan JSON service accounta ... }"""
-USE_GDRIVE = True
+# ---------------------------
+# UI & Branding
+# ---------------------------
+st.set_page_config(page_title="Analiza prodaje Austrija", layout="wide", page_icon="📈")
+logo_path = os.path.join(os.getcwd(), "mtel.png")
+c0, c1 = st.columns([1, 5])
+with c0:
+    if os.path.exists(logo_path):
+        st.image(logo_path, use_container_width=True)
+with c1:
+    st.title("Analiza prodaje Austrija")
+    st.caption("Razvijeno od strane *gennaro*")
 
-try:
-    from pydrive2.auth import GoogleAuth
-    from pydrive2.drive import GoogleDrive
-    import json
-except Exception:
-    USE_GDRIVE = False  # lokalni fallback (bez Drive-a)
+# ---------------------------
+# Google Drive helpers
+# ---------------------------
 
 def _gdrive():
-    """Autentikacija na Google Drive preko service account JSON-a iz secrets."""
-    ga = GoogleAuth()
-    ga.auth_method = 'service'
-    creds = json.loads(st.secrets["gdrive"]["SERVICE_ACCOUNT_JSON"])
-    # upiši privremeni json fajl da bismo ga dali pydrive2
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w") as tf:
-        tf.write(json.dumps(creds))
-        tf.flush()
-        ga.settings['service_config'] = ga.settings.get('service_config', {})
-        ga.settings['service_config']['client_json_file_path'] = tf.name
-        ga.ServiceAuth()
-    return GoogleDrive(ga)
+    """Autentikacija na Google Drive preko service accounta (PyDrive2)."""
+    try:
+        from pydrive2.auth import GoogleAuth
+        from pydrive2.drive import GoogleDrive
 
-def gdrive_list_reports():
-    """Vrati imena ALL_CONTRACT_YYYY_MM.xlsx iz određenog foldera na Drive-u."""
+        ga = GoogleAuth()
+        ga.auth_method = 'service'
+
+        creds = json.loads(st.secrets["gdrive"]["SERVICE_ACCOUNT_JSON"])
+        sa_email = creds.get("client_email")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w") as tf:
+            tf.write(json.dumps(creds))
+            tf.flush()
+            ga.settings['service_config'] = {
+                'client_json_file_path': tf.name,
+                'client_user_email': sa_email,
+            }
+            ga.ServiceAuth()
+
+        return GoogleDrive(ga)
+    except Exception as e:
+        st.error(f"❌ GDrive autentikacija nije uspjela: {e}")
+        st.stop()
+
+
+def gdrive_list_reports() -> List[str]:
+    """Vrati nazive ALL_CONTRACT_YYYY_MM.xlsx fajlova iz definisanog GDrive foldera."""
+    try:
+        drv = _gdrive()
+        folder_id = st.secrets["gdrive"]["FOLDER_ID"]
+        q = (
+            f"'{folder_id}' in parents and "
+            "mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' and "
+            "trashed=false"
+        )
+        file_list = drv.ListFile({'q': q}).GetList()
+        rx = re.compile(r"^ALL_CONTRACT_(20\d{2})_(0[1-9]|1[0-2])\.xlsx$")
+        names = [f['title'] for f in file_list if rx.match(f['title'])]
+        return sorted(set(names))
+    except Exception as e:
+        st.error(f"❌ Ne mogu listati fajlove na Google Drive-u: {e}")
+        st.info("Provjeri: Secrets (FOLDER_ID/SERVICE_ACCOUNT_JSON), share na service account email i nazive fajlova (ALL_CONTRACT_YYYY_MM.xlsx).")
+        st.stop()
+
+
+def gdrive_download(name: str) -> bytes:
+    """Preuzmi XLSX kao RAW bajtove (isti tok kao drag&drop)."""
     drv = _gdrive()
     folder_id = st.secrets["gdrive"]["FOLDER_ID"]
     q = (
         f"'{folder_id}' in parents and "
+        f"title = '{name}' and "
         "mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' and "
         "trashed=false"
     )
-    file_list = drv.ListFile({'q': q}).GetList()
-    rx = re.compile(r"^ALL_CONTRACT_(20\d{2})_(0[1-9]|1[0-2])\.xlsx$")
-    names = [f['title'] for f in file_list if rx.match(f['title'])]
-    return sorted(set(names))
-
-def gdrive_read_file_bytes(name: str) -> bytes:
-    drv = _gdrive()
-    folder_id = st.secrets["gdrive"]["FOLDER_ID"]
-    q = f"title='{name}' and '{folder_id}' in parents and trashed=false"
-    fl = drv.ListFile({'q': q}).GetList()
-    if not fl:
-        raise FileNotFoundError(name)
-    f = fl[0]
-    return f.GetContentBinary()
-
-def gdrive_upload_file(name: str, file_bytes: bytes):
-    drv = _gdrive()
-    folder_id = st.secrets["gdrive"]["FOLDER_ID"]
-    # pydrive2 najlakše uploaduje iz TEMP fajla:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tf:
-        tf.write(file_bytes)
-        tf.flush()
-        f = drv.CreateFile({"title": name, "parents": [{"id": folder_id}]})
-        f.SetContentFile(tf.name)
-        f.Upload()
-
-# =========================
-#   PAGE LAYOUT & HEADER
-# =========================
-st.set_page_config(page_title="Analiza prodaje Austrija", layout="wide")
-
-cols = st.columns([1, 6])
-with cols[0]:
+    lst = drv.ListFile({'q': q}).GetList()
+    if not lst:
+        raise FileNotFoundError(f"Nema fajla '{name}' u Drive folderu.")
+    f = lst[0]
+    # RAW bytes bez lokalnog snimanja
     try:
-        st.image("mtel.png", use_container_width=True)
+        content = f.GetContentBinary()
+        if isinstance(content, str):
+            content = content.encode("latin-1", errors="ignore")
+        return content
     except Exception:
-        st.write("")
-with cols[1]:
-    st.title("Analiza prodaje Austrija")
-    st.markdown("_Razvijeno od strane **gennaro**_")
-    st.caption(
-        "Online analiza ugovora po uslugama (MOBILE, TV, INTERNET, TV GO), POS tipovima, Business/Rezidencijala, "
-        "tarife (TV=STARNET uz internet), telefoni, STB/STB2, KPI. Trendovi po mjesecima/kvartalima (samo NOVI). "
-        "Poseban ekran: Uporedna analiza 2 mjeseca (% razlike)."
-    )
+        # fallback preko temp fajla
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+            tmp_path = tmp.name
+        try:
+            f.GetContentFile(tmp_path)
+            with open(tmp_path, "rb") as fh:
+                data = fh.read()
+            return data
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
-# =========================
-#   HELPER FUNKCIJE
-# =========================
-def norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", str(s).strip().lower())
+# ---------------------------
+# Excel reading (ultimate ZIP/XML fallback — bez stilova)
+# ---------------------------
 
-def find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    colmap = {norm(c): c for c in df.columns.astype(str)}
-    for k, orig in colmap.items():
-        for c in candidates:
-            if c == k or c in k:
-                return orig
+def _read_excel_any(xls_bytes_or_path) -> pd.DataFrame:
+    """
+    Ultimate fallback za čitanje .xlsx/.xlsm:
+    - Ne koristi pandas.read_excel niti openpyxl stilove.
+    - Čita direktno iz ZIP-a (sharedStrings + prvi worksheet).
+    - Ignoriše sve stilove/makroe/conditional formatting.
+    - Prvi red tretira kao header ako izgleda tekstualno.
+    """
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    if isinstance(xls_bytes_or_path, (bytes, bytearray)):
+        bio = io.BytesIO(xls_bytes_or_path)
+    elif hasattr(xls_bytes_or_path, "read"):
+        bio = io.BytesIO(xls_bytes_or_path.read())
+    else:
+        bio = open(xls_bytes_or_path, "rb")
+
+    try:
+        with zipfile.ZipFile(bio) as z:
+            # sharedStrings
+            shared = []
+            if "xl/sharedStrings.xml" in z.namelist():
+                xml_ss = ET.parse(z.open("xl/sharedStrings.xml")).getroot()
+                for si in xml_ss.findall("{http://schemas.openxmlformats.org/spreadsheetml/2006/main}si"):
+                    text_elems = si.findall(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t")
+                    text = "".join([(t.text or "") for t in text_elems])
+                    shared.append(text)
+
+            # prvi sheet (sheet1.xml ili najmanji sheetN.xml)
+            sheet_name = "xl/worksheets/sheet1.xml" if "xl/worksheets/sheet1.xml" in z.namelist() else None
+            if sheet_name is None:
+                candidates = [n for n in z.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")]
+                sheet_name = sorted(candidates)[0] if candidates else None
+            if not sheet_name:
+                raise RuntimeError("Nema sheet XML-a u XLSX fajlu.")
+
+            xml_ws = ET.parse(z.open(sheet_name)).getroot()
+            ns = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+            rows = []
+            for row in xml_ws.findall("a:sheetData/a:row", ns):
+                vals = []
+                for c in row.findall("a:c", ns):
+                    t = c.attrib.get("t")
+                    v = c.find("a:v", ns)
+                    if v is None:
+                        vals.append(None)
+                    elif t == "s":  # shared string
+                        try:
+                            vals.append(shared[int(v.text)])
+                        except Exception:
+                            vals.append(v.text)
+                    else:
+                        vals.append(v.text)
+                rows.append(vals)
+
+            if not rows:
+                return pd.DataFrame()
+
+            header_candidate = rows[0]
+            if all((isinstance(x, str) or x is None) for x in header_candidate):
+                cols = [x if (x is not None and str(x).strip() != "") else f"Col_{i+1}" for i, x in enumerate(header_candidate)]
+                df = pd.DataFrame(rows[1:], columns=cols)
+            else:
+                df = pd.DataFrame(rows)
+
+            df = df.dropna(how="all").reset_index(drop=True)
+            df.columns = [str(c).strip() for c in df.columns]
+            return df
+
+    except Exception as e:
+        raise RuntimeError(f"Ne mogu pročitati Excel (fallback): {e}")
+
+# ---------------------------
+# Column detection
+# ---------------------------
+
+def find_col(df: pd.DataFrame, candidates: List[str], fallback_letter: Optional[str]=None) -> Optional[str]:
+    cols = {str(c).strip(): c for c in df.columns}
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand in cols:
+            return cols[cand]
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
+    if fallback_letter:
+        def excel_letter_to_idx(s):
+            s = s.strip().upper()
+            val = 0
+            for ch in s:
+                val = val*26 + (ord(ch)-64)
+            return val-1
+        idx = excel_letter_to_idx(fallback_letter)
+        if 0 <= idx < df.shape[1]:
+            return df.columns[idx]
     return None
 
-def parse_excel_datetime(val):
-    if pd.isna(val):
-        return pd.NaT
-    if isinstance(val, pd.Timestamp):
-        return val
-    if isinstance(val, (int, float)) and not isinstance(val, bool):
-        try:
-            return pd.to_datetime(val, unit="d", origin="1899-12-30")
-        except Exception:
-            pass
-    s = str(val).strip()
-    for fmt in ("%d.%m.%y %H:%M", "%d.%m.%Y %H:%M"):
-        try:
-            return pd.to_datetime(datetime.strptime(s, fmt))
-        except Exception:
-            continue
-    return pd.to_datetime(s, dayfirst=True, errors="coerce")
 
-def truthy(v) -> bool:
-    if pd.isna(v):
-        return False
-    if isinstance(v, (bool, np.bool_)):
-        return bool(v)
-    return str(v).strip().lower() in {"true", "1", "da", "yes", "y", "t", "x"}
+def detect_pos_col(df: pd.DataFrame) -> Optional[str]:
+    pos_keywords = ["vip_", "hartlauer", "web", "telesales", "wmh", "wth", "wdz", "d2"]
+    for name in df.columns:
+        lname = str(name).lower()
+        if any(k in lname for k in ["pos", "shop", "salespoint", "channel", "store"]):
+            return name
+    object_cols = [c for c in df.columns if df[c].dtype == object]
+    for c in object_cols:
+        series = df[c].dropna().astype(str).str.lower()
+        if series.str.contains("|".join(pos_keywords), regex=True).any():
+            return c
+    if "POS" in df.columns:
+        return "POS"
+    return None
 
-def has_value(v) -> bool:
-    if pd.isna(v):
-        return False
-    if isinstance(v, str):
-        s = v.strip().lower()
-        return len(s) > 0 and s not in {"nan", "none", "null"}
-    return True
+# ---------------------------
+# POS Mapping rules
+# ---------------------------
 
-def services_for_row(r: pd.Series) -> list[str]:
-    s = []
-    if r.get("_mobile", False):
-        s.append("MOBILE")
-    if r.get("_tv", False):
-        s.append("TV")
-    if r.get("_inet_modem", False):
-        s.append("INTERNET")
-        if r.get("_price_tv", False):
-            s.append("TV")  # TV uz internet -> brojimo i TV
-    if r.get("_mobile", False) and (not r.get("_tv", False)) and r.get("_price_tv", False):
-        s.append("TV GO")
-    return s
+VIP_SPECIAL = {"VIP_GCP", "VIP_LHP", "VIP_SSA", "VIP_WHE", "VIP_WLC", "VIP_WTR"}
 
-def map_pos_tip(pos_val: str) -> str:
-    s = "" if pd.isna(pos_val) else str(pos_val)
-    su = s.upper()
-    if su.startswith("VIP_GCP"): return "VIP_GCP"
-    if su.startswith("VIP_LHP"): return "VIP_LHP"
-    if su.startswith("VIP_SSA"): return "VIP_SSA"
-    if su.startswith("VIP_WHE"): return "VIP_WHE"
-    if su.startswith("VIP_WLC"): return "VIP_WLC"
-    if su.startswith("VIP_WTR"): return "VIP_WTR"
-    if su.startswith("VIP_"):    return "VIP_OTHER"
-    if "WMH" in su:               return "WMH"
-    if "WTH" in su:               return "WTH"
-    if "WDZ" in su:               return "WDZ"
-    if "HARTLAUER" in su:         return "HARTLAUER"
-    if "WEB" in su:               return "WEB"
-    if "TELESALES" in su:         return "TELESALES"
-    if "D2" in su:                return "D2D"
+def map_pos_type(raw_name: str) -> str:
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        return "MULTIBREND"
+    s = raw_name.strip()
+    s_upper = s.upper()
+
+    for direct in ["WMH", "WTH", "WDZ"]:
+        if s_upper.startswith(direct):
+            return direct
+
+    if s_upper.startswith("VIP_"):
+        if s_upper in VIP_SPECIAL:
+            return s_upper
+        return s_upper
+
+    if "BUSINESS" in s_upper:
+        return "BUSINESS"
+
+    if "D2" in s_upper:
+        return "D2D"
+
+    if "HARTLAUER" in s_upper:
+        return "HARTLAUER"
+    if s_upper == "WEB" or " WEB" in s_upper or s_upper.startswith("WEB"):
+        return "WEB"
+    if "TELESALES" in s_upper:
+        return "TELESALES"
+
     return "MULTIBREND"
 
-def derive_period_from_filename(name: str) -> tuple[int | None, int | None]:
-    m = re.search(r"ALL_CONTRACT_(20\d{2})_(0[1-9]|1[0-2])\.xlsx$", name or "")
-    if m:
-        return int(m.group(1)), int(m.group(2))
-    return None, None
+# ---------------------------
+# Helpers
+# ---------------------------
 
-def with_totals_pivot(pivot_df: pd.DataFrame) -> pd.DataFrame:
-    df = pivot_df.copy()
-    df["UKUPNO"] = df.select_dtypes(include=[np.number]).sum(axis=1)
-    total_row = pd.DataFrame(df.select_dtypes(include=[np.number]).sum()).T
-    total_row.index = ["UKUPNO"]
-    out = pd.concat([df, total_row], axis=0)
-    for c in out.columns:
-        if pd.api.types.is_numeric_dtype(out[c]):
-            out[c] = out[c].astype(int)
+def parse_month_from_filename(name: str) -> Optional[Tuple[int,int]]:
+    m = re.match(r'^ALL_CONTRACT_(20\d{2})_(0[1-9]|1[0-2])\.xlsx$', name)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def to_datetime_safe(s) -> Optional[datetime]:
+    if pd.isna(s):
+        return None
+    if isinstance(s, datetime):
+        return s
+    for fmt in ("%d.%m.%y %H:%M", "%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(str(s), fmt)
+        except Exception:
+            pass
+    try:
+        return pd.to_datetime(s, dayfirst=True, errors="coerce")
+    except Exception:
+        return None
+
+# ---------------------------
+# ENRICH (glavna logika — identično kao jutros)
+# ---------------------------
+
+def enrich(df: pd.DataFrame, file_year: Optional[int]=None, file_month: Optional[int]=None) -> pd.DataFrame:
+    col_start = find_col(df, ["Start"], "D")
+    col_contract_type = find_col(df, ["ContractType"], "I")
+    col_tariff = find_col(df, ["Tariff", "TariffName", "NazivTarife"], "H")
+    col_mobile_tar = find_col(df, ["log_mobiletariff"], "Q")
+    col_tv_tar = find_col(df, ["log_tvtariff"], "R")
+    col_price_tv = find_col(df, ["Price_TV"], "T")
+    col_mdevice = find_col(df, ["MobileDevice"], "AA")
+    col_tvdevice = find_col(df, ["TVDevice"], "AD")
+    col_idevice = find_col(df, ["InternetDevice"], "AE")
+    col_pos = detect_pos_col(df) or "POS"
+
+    ren = {}
+    if col_start: ren[col_start] = "_Start"
+    if col_contract_type: ren[col_contract_type] = "_ContractType"
+    if col_tariff: ren[col_tariff] = "_Tariff"
+    if col_mobile_tar: ren[col_mobile_tar] = "_log_mobiletariff"
+    if col_tv_tar: ren[col_tv_tar] = "_log_tvtariff"
+    if col_price_tv: ren[col_price_tv] = "_Price_TV"
+    if col_mdevice: ren[col_mdevice] = "_MobileDevice"
+    if col_tvdevice: ren[col_tvdevice] = "_TVDevice"
+    if col_idevice: ren[col_idevice] = "_InternetDevice"
+    if col_pos: ren[col_pos] = "_POS_RAW"
+
+    df = df.rename(columns=ren).copy()
+
+    # POS tip i Business flag
+    df["_POS_TIP"] = df.get("_POS_RAW", pd.Series([""]*len(df))).astype(str).map(map_pos_type)
+    df["_BUSINESS"] = df.get("_ContractType", "").astype(str).str.upper().eq("BUSINESS")
+
+    # Detekcija (year, month) za NOVE ugovore
+    if file_year is None or file_month is None:
+        dt = df.get("_Start")
+        if dt is not None and not pd.Series(dt).isna().all():
+            any_dt = to_datetime_safe(pd.Series(dt).dropna().iloc[0])
+            if isinstance(any_dt, (pd.Timestamp, datetime)):
+                file_year, file_month = any_dt.year, any_dt.month
+
+    df["_StartDT"] = df.get("_Start").map(to_datetime_safe) if "_Start" in df.columns else pd.NaT
+    df["_IS_NEW"] = False
+    if file_year and file_month:
+        df["_IS_NEW"] = df["_StartDT"].apply(
+            lambda x: isinstance(x, (pd.Timestamp, datetime)) and x.year == file_year and x.month == file_month
+        )
+
+    # NORMALIZACIJA Q/R NA "TRUE"/"FALSE" (da ostane stara logika)
+    def _to_TRUE_FALSE(x):
+        s = str(x).strip().upper()
+        if s in ("1", "TRUE", "T"):
+            return "TRUE"
+        if s in ("0", "FALSE", "F", "", "NONE", "NAN", "NULL"):
+            return "FALSE"
+        return s
+
+    if "_log_mobiletariff" in df.columns:
+        df["_log_mobiletariff"] = df["_log_mobiletariff"].apply(_to_TRUE_FALSE)
+    if "_log_tvtariff" in df.columns:
+        df["_log_tvtariff"] = df["_log_tvtariff"].apply(_to_TRUE_FALSE)
+
+    # STARA PROVJERENA LOGIKA
+    is_mobile   = df.get("_log_mobiletariff", False).astype(str).str.upper().eq("TRUE")
+    is_tv       = df.get("_log_tvtariff",    False).astype(str).str.upper().eq("TRUE")
+    is_internet = df.get("_InternetDevice",  "").astype(str).str.upper().eq("MODEM")
+
+    has_tv_price = df.get("_Price_TV")
+    if has_tv_price is not None:
+        has_tv_price = pd.to_numeric(has_tv_price, errors="coerce").fillna(0) != 0
+    else:
+        has_tv_price = pd.Series([False]*len(df))
+
+    df["_SERV_MOBILE"]   = is_mobile
+    df["_SERV_INTERNET"] = is_internet
+    df["_SERV_TV"]       = (is_tv) | (is_internet & has_tv_price)
+    df["_SERV_TVGO"]     = (is_mobile & (~is_tv) & has_tv_price)
+
+    # TV uređaji
+    tvdev = df.get("_TVDevice", "").astype(str).str.upper()
+    df["_STB"]  = tvdev.eq("STB").astype(int)
+    df["_STB2"] = tvdev.eq("STB2").astype(int)
+
+    # MobileDevice — samo očisti prazno/"-"; računamo identično kao ranije (.notna())
+    df["_MobileDevice"] = (
+        df.get("_MobileDevice", np.nan)
+          .astype(str).str.strip()
+          .replace({"": np.nan, "-": np.nan, "N/A": np.nan, "None": np.nan, "NONE": np.nan, "nan": np.nan})
+    )
+
+    # Tarife — TV tarife iz Internet paketa = STARNET
+    df["_Tariff"] = df.get("_Tariff", np.nan).astype(str).replace({"nan": np.nan})
+    df["_Tariff_TV"] = np.where((is_internet & has_tv_price), "STARNET", np.where(is_tv, df["_Tariff"], np.nan))
+    df["_Tariff_MOBILE"] = np.where(is_mobile, df["_Tariff"], np.nan)
+    df["_Tariff_INTERNET"] = np.where(is_internet, df["_Tariff"], np.nan)
+
+    df["_POS_TIP_BUS"] = np.where(df["_BUSINESS"], df["_POS_TIP"] + " (BUSINESS)", df["_POS_TIP"] + " (RES)")
+    return df
+
+# ---------------------------
+# Aggregations & Views
+# ---------------------------
+
+def kpi_counts(df: pd.DataFrame):
+    total_mobile = int(df["_SERV_MOBILE"].sum())
+    total_tv     = int(df["_SERV_TV"].sum())
+    total_inet   = int(df["_SERV_INTERNET"].sum())
+    total_tvgo   = int(df["_SERV_TVGO"].sum())
+    total_phones = int(df["_MobileDevice"].notna().sum())  # identično kao ranije
+    return total_mobile, total_tv, total_inet, total_tvgo, total_phones
+
+
+def pivot_services_by_pos(df: pd.DataFrame, business_only=None):
+    d = df.copy()
+    if business_only is True:
+        d = d[d["_BUSINESS"]]
+    elif business_only is False:
+        d = d[~d["_BUSINESS"]]
+
+    cols = ["_SERV_MOBILE", "_SERV_TV", "_SERV_INTERNET", "_SERV_TVGO"]
+    pivot = d.groupby("_POS_TIP")[cols].sum().astype(int)
+    pivot = pivot.rename(columns={
+        "_SERV_MOBILE": "MOBILE",
+        "_SERV_TV": "TV",
+        "_SERV_INTERNET": "INTERNET",
+        "_SERV_TVGO": "TV GO",
+    }).sort_index()
+    pivot.loc["Ukupno"] = pivot.sum(numeric_only=True)
+    return pivot
+
+
+def phones_by_model_pos(df: pd.DataFrame):
+    d = df[df["_MobileDevice"].notna()].copy()  # isto kao ranije
+    if d.empty:
+        return pd.DataFrame()
+    p = pd.pivot_table(d, index="_MobileDevice", columns="_POS_TIP", values="_POS_TIP", aggfunc="count", fill_value=0)
+    p = p.sort_index()
+    p.loc["Ukupno"] = p.sum(numeric_only=True)
+    return p
+
+
+def stb_by_pos(df: pd.DataFrame):
+    p = df.groupby("_POS_TIP")[["_STB", "_STB2"]].sum().astype(int).sort_index()
+    p.loc["Ukupno"] = p.sum(numeric_only=True)
+    return p
+
+
+def tariffs_sold(df: pd.DataFrame):
+    res = {}
+    t_m = df["_Tariff_MOBILE"].dropna()
+    res["MOBILE"] = t_m.value_counts().to_frame("Count")
+
+    t_tv = df["_Tariff_TV"].dropna()
+    res["TV"] = t_tv.value_counts().to_frame("Count")
+
+    t_i = df["_Tariff_INTERNET"].dropna()
+    res["INTERNET"] = t_i.value_counts().to_frame("Count")
+    return res
+
+
+def only_new(df: pd.DataFrame) -> pd.DataFrame:
+    return df[df["_IS_NEW"]]
+
+
+def monthly_trend(dfs: List[Tuple[str, pd.DataFrame]]) -> pd.DataFrame:
+    rows = []
+    for name, d in dfs:
+        ym = parse_month_from_filename(name)
+        if not ym:
+            continue
+        y, m = ym
+        dn = only_new(d)
+        M, T, I, TG, _ = kpi_counts(dn)
+        rows.append({"year": y, "month": m, "MOBILE": M, "TV": T, "INTERNET": I, "TV GO": TG})
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows).sort_values(["year", "month"])
+    out["YM"] = out.apply(lambda r: f"{int(r['year'])}-{int(r['month']):02d}", axis=1)
+    return out[["YM", "MOBILE", "TV", "INTERNET", "TV GO"]]
+
+
+def quarterly_trend(monthly: pd.DataFrame) -> pd.DataFrame:
+    if monthly.empty:
+        return monthly
+    tmp = monthly.copy()
+    tmp["year"] = tmp["YM"].str.slice(0,4).astype(int)
+    tmp["month"] = tmp["YM"].str.slice(5,7).astype(int)
+    tmp["Q"] = ((tmp["month"]-1)//3 + 1).astype(int)
+    qdf = tmp.groupby(["year", "Q"])[["MOBILE","TV","INTERNET","TV GO"]].sum().reset_index()
+    qdf["YQ"] = qdf.apply(lambda r: f"{int(r['year'])} Q{int(r['Q'])}", axis=1)
+    return qdf[["YQ","MOBILE","TV","INTERNET","TV GO"]]
+
+
+def compare_two(dfa: pd.DataFrame, dfb: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    resA = pivot_services_by_pos(dfa, business_only=False)
+    resB = pivot_services_by_pos(dfb, business_only=False)
+    busA = pivot_services_by_pos(dfa, business_only=True)
+    busB = pivot_services_by_pos(dfb, business_only=True)
+    return resA, resB, busA, busB
+
+
+def diff_with_pct(a: pd.DataFrame, b: pd.DataFrame, label_new="Noviji", label_old="Stariji") -> pd.DataFrame:
+    cols = sorted(set(a.columns).union(b.columns))
+    idx = sorted(set(a.index).union(b.index))
+    A = a.reindex(index=idx, columns=cols).fillna(0)
+    B = b.reindex(index=idx, columns=cols).fillna(0)
+    D = A - B
+    pct_df = pd.DataFrame(index=idx, columns=[c+" %Δ" for c in cols], dtype=float)
+
+    def pct(x, y):
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return np.where(y==0, np.nan, (x/y - 1.0) * 100.0)
+
+    for c in cols:
+        pct_df[c+" %Δ"] = pct(A[c].values, B[c].values)
+
+    out = pd.concat([A.add_prefix(f"{label_new} "),
+                     B.add_prefix(f"{label_old} "),
+                     D.add_prefix("Δ "),
+                     pct_df], axis=1)
     return out
 
-def with_total_row(df: pd.DataFrame, value_col: str = "broj", label_col: str | None = None, label: str = "UKUPNO") -> pd.DataFrame:
-    total = int(df[value_col].sum()) if value_col in df.columns else 0
-    if label_col and label_col in df.columns:
-        total_row = pd.DataFrame({label_col: [label], value_col: [total]})
-        return pd.concat([df, total_row], ignore_index=True)
-    total_row = pd.DataFrame({value_col: [total]})
-    total_row.index = [label]
-    return pd.concat([df, total_row], ignore_index=False)
+# ---------------------------
+# File loading (single & multi)
+# ---------------------------
 
-# ============ XLSX load helpers ============
-def repair_xlsx(file_like: io.BytesIO) -> io.BytesIO:
-    inp = io.BytesIO(file_like.read())
-    inp.seek(0)
-    out_buf = io.BytesIO()
-    with zipfile.ZipFile(inp, "r") as zin, zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout:
-        for item in zin.infolist():
-            if item.filename.lower() in {"xl/styles.xml", "xl/theme/theme1.xml"}:
-                continue
-            data = zin.read(item.filename)
-            if item.filename.lower().endswith((".xml", ".rels")):
-                try:
-                    text = data.decode("utf-8")
-                    text = re.sub(r"http:\s*//", "http://", text)
-                    text = re.sub(r"https:\s*//", "https://", text)
-                    data = text.encode("utf-8")
-                except Exception:
-                    pass
-            zout.writestr(item, data)
-    out_buf.seek(0)
-    return out_buf
+def load_one_from_bytes(x: bytes, filename_for_period: Optional[str]=None) -> pd.DataFrame:
+    df = _read_excel_any(x)
+    y, m = (None, None)
+    if filename_for_period:
+        pm = parse_month_from_filename(filename_for_period)
+        if pm:
+            y, m = pm
+    return enrich(df, y, m)
 
-def load_one_excel(file_bytes: bytes, filename_hint: str) -> pd.DataFrame:
-    frames = []
-    fbytes = io.BytesIO(file_bytes)
-    fbytes.seek(0)
-    try:
-        xls = pd.ExcelFile(fbytes, engine="openpyxl")
-        for s in xls.sheet_names:
-            d = pd.read_excel(xls, sheet_name=s)
-            d["__source_sheet__"] = s
-            d["__file__"] = os.path.basename(filename_hint)
-            frames.append(d)
-    except Exception:
-        cleaned = repair_xlsx(io.BytesIO(file_bytes))
-        xls = pd.ExcelFile(cleaned, engine="openpyxl")
-        for s in xls.sheet_names:
-            d = pd.read_excel(xls, sheet_name=s)
-            d["__source_sheet__"] = s
-            d["__file__"] = os.path.basename(filename_hint)
-            frames.append(d)
-    return pd.concat(frames, ignore_index=True)
 
-# ===== Helperi za mjesečne pripreme (uporedna analiza) =====
-def preprocess_month_df(raw_month: pd.DataFrame) -> pd.DataFrame:
-    col_mobile         = find_col(raw_month, ["log_mobiletariff", "mobiletariff"])
-    col_tv             = find_col(raw_month, ["log_tvtariff", "tvtariff"])
-    col_price_tv       = find_col(raw_month, ["price_tv", "tv_price"])
-    col_inet_dev       = find_col(raw_month, ["internetdevice", "internet_device"])
-    col_pos            = find_col(raw_month, ["pos", "pos_name", "shop", "store"])
-    col_start          = find_col(raw_month, ["start"])
-    col_contract_type  = find_col(raw_month, ["contracttype"])
+def load_from_gdrive(name: str) -> pd.DataFrame:
+    y, m = (None, None)
+    pm = parse_month_from_filename(name)
+    if pm:
+        y, m = pm
+    data = gdrive_download(name)  # RAW bytes
+    df = _read_excel_any(data)
+    return enrich(df, y, m)
 
-    dfm = raw_month.copy()
-    dfm["_start_dt"] = dfm[col_start].apply(parse_excel_datetime) if col_start in dfm.columns else pd.NaT
-    dfm["_is_business"] = (
-        dfm[col_contract_type].astype(str).str.strip().str.upper().eq("BUSINESS")
-        if col_contract_type in dfm.columns else False
-    )
-    dfm["_mobile"]     = dfm[col_mobile].map(truthy) if col_mobile in dfm.columns else False
-    dfm["_tv"]         = dfm[col_tv].map(truthy) if col_tv in dfm.columns else False
-    dfm["_price_tv"]   = dfm[col_price_tv].map(has_value) if col_price_tv in dfm.columns else False
-    dfm["_inet_modem"] = dfm[col_inet_dev].astype(str).str.strip().str.upper().eq("MODEM") if col_inet_dev in dfm.columns else False
-    dfm["_services"]   = dfm.apply(services_for_row, axis=1)
-    dfm["POS_TIP"]     = dfm[col_pos].apply(map_pos_tip) if col_pos in dfm.columns else "MULTIBREND"
-    return dfm
+# ---------------------------
+# Sidebar — režimi
+# ---------------------------
 
-def pos_pivot_by_business(dfm: pd.DataFrame):
-    long = dfm[["_services", "POS_TIP", "_is_business"]].explode("_services").dropna()
-    bus = long[long["_is_business"]]
-    res = long[~long["_is_business"]]
-
-    def _pivot(sub):
-        p = (sub.groupby(["POS_TIP", "_services"]).size().reset_index(name="broj")
-               .pivot(index="POS_TIP", columns="_services", values="broj")
-               .fillna(0).astype(int))
-        for c in ["MOBILE", "TV", "INTERNET", "TV GO"]:
-            if c not in p.columns:
-                p[c] = 0
-        return p[["MOBILE", "TV", "INTERNET", "TV GO"]]
-
-    return _pivot(bus), _pivot(res)
-
-def pct_change_table(new_df: pd.DataFrame, old_df: pd.DataFrame) -> pd.DataFrame:
-    all_idx = sorted(set(old_df.index) | set(new_df.index))
-    all_cols = ["MOBILE", "TV", "INTERNET", "TV GO"]
-    new_al = new_df.reindex(index=all_idx, columns=all_cols).fillna(0)
-    old_al = old_df.reindex(index=all_idx, columns=all_cols).fillna(0)
-    diff = new_al - old_al
-    with np.errstate(divide="ignore", invalid="ignore"):
-        pct = (diff / old_al.replace(0, np.nan)) * 100
-    pct = pct.fillna(0)
-    pct[(old_al == 0) & (new_al > 0)] = np.inf
-    pct = pct.round(1)
-    return pct
-
-# =========================
-#   REŽIMI & UČITAVANJE
-# =========================
-st.sidebar.header("⚙️ Režim analize")
 mode = st.sidebar.radio(
     "Izaberi režim:",
     [
         "Analiza pojedinačnog fajla",
         "Analiza perioda (više fajlova)",
         "Uporedna analiza (2 mjeseca)",
-    ]
+    ],
+    index=0
 )
 
-compare_names = []
-idx_old = None
-idx_new = None
+# ---------------------------
+# MODE 1 — Single file
+# ---------------------------
 
 if mode == "Analiza pojedinačnog fajla":
-    uploaded = st.file_uploader("Uploaduj Excel (XLSX)", type=["xlsx"])
-    if not uploaded:
-        st.stop()
-    raw = load_one_excel(uploaded.read(), getattr(uploaded, "name", "uploaded.xlsx"))
+    st.subheader("📄 Analiza pojedinačnog fajla")
+    src = st.radio("Izvor podataka:", ["Upload (lokalno)", "Google Drive"], horizontal=True)
+
+    df_single = None
+    selected_name = None
+
+    if src == "Upload (lokalno)":
+        up = st.file_uploader("Učitaj ALL_CONTRACT_YYYY_MM.xlsx", type=["xlsx"])
+        if up is not None:
+            selected_name = up.name
+            try:
+                df_single = load_one_from_bytes(up.read(), filename_for_period=selected_name)
+            except Exception as e:
+                st.error(f"Ne mogu učitati fajl: {e}")
+
+    else:
+        names = gdrive_list_reports()
+        if not names:
+            st.warning("Nema fajlova 'ALL_CONTRACT_YYYY_MM.xlsx' u Drive folderu.")
+        else:
+            selected_name = st.selectbox("Izaberi fajl sa GDrive:", names, index=len(names)-1)
+            if selected_name:
+                with st.spinner("Čitam sa Google Drive-a..."):
+                    df_single = load_from_gdrive(selected_name)
+
+    if df_single is not None and not df_single.empty:
+        # KPI
+        M, T, I, TG, PH = kpi_counts(df_single)
+        k1,k2,k3,k4,k5 = st.columns(5)
+        k1.metric("MOBILE", M)
+        k2.metric("TV", T)
+        k3.metric("INTERNET", I)
+        k4.metric("TV GO", TG)
+        k5.metric("Telefoni", PH)
+
+        st.markdown("---")
+
+        # Prodaja po POS tipu (svi)
+        st.markdown("### Prodaja po POS tipu — svi ugovori")
+        st.dataframe(pivot_services_by_pos(df_single))
+
+        # Business posebno
+        st.markdown("### Prodaja po POS tipu — samo BUSINESS")
+        st.dataframe(pivot_services_by_pos(df_single, business_only=True))
+
+        # Rezidencijala posebno
+        st.markdown("### Prodaja po POS tipu — REZIDENCIJALA (bez BUSINESS)")
+        st.dataframe(pivot_services_by_pos(df_single, business_only=False))
+
+        st.markdown("---")
+        st.markdown("### Prodaja tarifa")
+        tabs = st.tabs(["MOBILE", "TV (uklj. STARNET uz internet)", "INTERNET"])
+        tariffs = tariffs_sold(df_single)
+        with tabs[0]:
+            st.dataframe(tariffs["MOBILE"])
+        with tabs[1]:
+            st.dataframe(tariffs["TV"])
+        with tabs[2]:
+            st.dataframe(tariffs["INTERNET"])
+
+        st.markdown("---")
+        st.markdown("### Telefoni po POS tipu")
+        ph = phones_by_model_pos(df_single)
+        if ph.empty:
+            st.info("Nema prodatih telefona u ovom periodu.")
+        else:
+            st.dataframe(ph)
+
+        st.markdown("---")
+        st.markdown("### STB uređaji po POS-u (STB / STB2)")
+        st.dataframe(stb_by_pos(df_single))
+
+# ---------------------------
+# MODE 2 — Multi files (period)
+# ---------------------------
 
 elif mode == "Analiza perioda (više fajlova)":
-    st.sidebar.caption("Skladište: Google Drive")
+    st.subheader("🗓 Analiza perioda (više fajlova)")
 
-    # Upload u GDrive (opciono)
-    up = st.sidebar.file_uploader("📤 Upload novog izvještaja (XLSX)", type=["xlsx"], key="u_multi")
-    if up is not None and USE_GDRIVE:
-        suggested = up.name
-        if not re.match(r"^ALL_CONTRACT_(20\d{2})_(0[1-9]|1[0-2])\.xlsx$", suggested, re.I):
-            suggested = st.sidebar.text_input("Naziv u skladištu", "ALL_CONTRACT_2025_10.xlsx")
-        else:
-            st.sidebar.text_input("Naziv u skladištu", suggested, disabled=True)
-        if st.sidebar.button("Snimi na Drive"):
-            gdrive_upload_file(suggested, up.read())
-            st.sidebar.success(f"Snimljeno: {suggested}")
+    names = gdrive_list_reports()
+    if not names:
+        st.warning("Nema fajlova 'ALL_CONTRACT_YYYY_MM.xlsx' u Drive folderu.")
+        st.stop()
 
-    if USE_GDRIVE:
-        entries = gdrive_list_reports()
-        if not entries:
-            st.warning("Nema fajlova u Google Drive folderu.")
-            st.stop()
-        ym_rows = []
-        for n in entries:
-            m = re.match(r"^ALL_CONTRACT_(20\d{2})_(0[1-9]|1[0-2])\.xlsx$", n)
-            ym_rows.append((int(m.group(1)), int(m.group(2)), n))
-        df_ym = pd.DataFrame(ym_rows, columns=["godina", "mjesec", "gdname"]).sort_values(["godina", "mjesec"])
+    years = sorted({int(n[13:17]) for n in names})
+    months_by_year = lambda y: sorted({int(n[18:20]) for n in names if int(n[13:17])==y})
+
+    c1,c2 = st.columns(2)
+    with c1:
+        y_from = st.selectbox("Godina od", years, index=0)
+        m_from = st.selectbox("Mjesec od", months_by_year(y_from), index=0)
+    with c2:
+        y_to = st.selectbox("Godina do", years, index=len(years)-1)
+        m_to = st.selectbox("Mjesec do", months_by_year(y_to), index=len(months_by_year(y_to))-1)
+
+    def ym_key(s):
+        y, m = parse_month_from_filename(s)
+        return (y, m)
+
+    y1, m1, y2, m2 = y_from, m_from, y_to, m_to
+    if (y1, m1) > (y2, m2):
+        st.error("Period je invertovan (OD > DO). Ispravi izbor.")
+        st.stop()
+
+    sel = [n for n in names if (y1, m1) <= ym_key(n) <= (y2, m2)]
+    st.caption(f"Izabrano fajlova: {len(sel)}")
+
+    data_list = []
+    for n in sel:
+        with st.spinner(f"Učitavam {n}..."):
+            data_list.append((n, load_from_gdrive(n)))
+
+    if not data_list:
+        st.warning("Nema podataka za izabrani period.")
+        st.stop()
+
+    df_all = pd.concat([d.assign(__file=n) for n,d in data_list], ignore_index=True)
+    df_new = only_new(df_all)
+    M, T, I, TG, PH = kpi_counts(df_new)
+    k1,k2,k3,k4,k5 = st.columns(5)
+    k1.metric("MOBILE (Novi)", M)
+    k2.metric("TV (Novi)", T)
+    k3.metric("INTERNET (Novi)", I)
+    k4.metric("TV GO (Novi)", TG)
+    k5.metric("Telefoni", PH)
+
+    st.markdown("---")
+    st.markdown("### Prodaja po POS tipu — Svi ugovori (period)")
+    st.dataframe(pivot_services_by_pos(df_all))
+
+    st.markdown("### Prodaja po POS tipu — samo BUSINESS")
+    st.dataframe(pivot_services_by_pos(df_all, business_only=True))
+
+    st.markdown("### Prodaja po POS tipu — REZIDENCIJALA (bez BUSINESS)")
+    st.dataframe(pivot_services_by_pos(df_all, business_only=False))
+
+    st.markdown("---")
+    st.markdown("### Trend po mjesecima (samo NOVE ugovore)")
+    monthly = monthly_trend(data_list)
+    if monthly.empty:
+        st.info("Nema mjesečnih podataka.")
     else:
-        st.warning("GDrive nije aktivan (pydrive2 nije instaliran ili nema secrets).")
-        st.stop()
+        st.dataframe(monthly.set_index("YM"))
+        fig, ax = plt.subplots(figsize=(10,4))
+        monthly.plot(x="YM", y=["MOBILE","TV","INTERNET","TV GO"], ax=ax)
+        ax.set_xlabel("Mjesec")
+        ax.set_ylabel("Broj ugovora (Novi)")
+        ax.set_title("Trend po mjesecima")
+        st.pyplot(fig)
 
-    if df_ym.empty:
-        st.warning("Nema fajlova za analizu.")
-        st.stop()
+    st.markdown("---")
+    st.markdown("### Trend po kvartalima (samo NOVE ugovore)")
+    qdf = quarterly_trend(monthly) if 'monthly' in locals() and not monthly.empty else pd.DataFrame()
+    if qdf.empty:
+        st.info("Nema kvartalnih podataka.")
+    else:
+        st.dataframe(qdf.set_index("YQ"))
+        fig2, ax2 = plt.subplots(figsize=(10,4))
+        qplot = qdf.set_index("YQ")[["MOBILE","TV","INTERNET","TV GO"]]
+        qplot.plot(kind="barh", ax=ax2)
+        ax2.set_xlabel("Broj ugovora (Novi)")
+        ax2.set_ylabel("Kvartal")
+        ax2.set_title("Trend po kvartalima")
+        st.pyplot(fig2)
 
-    god_l = sorted(df_ym["godina"].unique())
-    godina_od = st.sidebar.selectbox("Godina OD", god_l, index=0)
-    godina_do = st.sidebar.selectbox("Godina DO", god_l, index=len(god_l)-1)
-    mj_od = st.sidebar.slider("Mjesec OD", 1, 12, 1)
-    mj_do = st.sidebar.slider("Mjesec DO", 1, 12, 12)
-    mask = (
-        ((df_ym["godina"] > godina_od) | ((df_ym["godina"] == godina_od) & (df_ym["mjesec"] >= mj_od))) &
-        ((df_ym["godina"] < godina_do) | ((df_ym["godina"] == godina_do) & (df_ym["mjesec"] <= mj_do)))
-    )
-    chosen = df_ym.loc[mask].sort_values(["godina", "mjesec"])
-    if chosen.empty:
-        st.warning("Nema fajlova u izabranom opsegu.")
-        st.stop()
-
-    frames = []
-    for _, row in chosen.iterrows():
-        frames.append(load_one_excel(gdrive_read_file_bytes(row["gdname"]), row["gdname"]))
-    raw = pd.concat(frames, ignore_index=True)
+# ---------------------------
+# MODE 3 — Compare two months
+# ---------------------------
 
 elif mode == "Uporedna analiza (2 mjeseca)":
-    st.sidebar.caption("Skladište: Google Drive")
-    if USE_GDRIVE:
-        compare_names = gdrive_list_reports()
-    if not compare_names:
-        st.warning("Nema mjesečnih fajlova.")
-        st.stop()
-    month_keys = []
-    for f in compare_names:
-        m = re.match(r"^ALL_CONTRACT_(20\d{2})_(0[1-9]|1[0-2])\.xlsx$", f)
-        y, mo = int(m.group(1)), int(m.group(2))
-        month_keys.append((y, mo, f))
-    month_keys.sort()
-    labels = [f"{y}-{mo:02d}" for (y, mo, f) in month_keys]
-    idx_old = st.sidebar.selectbox("Stariji mjesec", list(range(len(labels))), format_func=lambda i: labels[i],
-                                   index=max(0, len(labels)-2), key="cmp_old_top")
-    idx_new = st.sidebar.selectbox("Noviji mjesec", list(range(len(labels))), format_func=lambda i: labels[i],
-                                   index=len(labels)-1, key="cmp_new_top")
-    raw = pd.DataFrame({"__file__": []})  # placeholder
+    st.subheader("🔁 Uporedna analiza (2 mjeseca) — KPI na Novim ugovorima")
 
-# =========================
-#   PRIPREMA I KALKULACIJE (za režime 1 i 2)
-# =========================
-if mode in ("Analiza pojedinačnog fajla", "Analiza perioda (više fajlova)"):
-    col_mobile         = find_col(raw, ["log_mobiletariff", "mobiletariff"])
-    col_tv             = find_col(raw, ["log_tvtariff", "tvtariff"])
-    col_price_tv       = find_col(raw, ["price_tv", "tv_price"])
-    col_inet_dev       = find_col(raw, ["internetdevice", "internet_device"])
-    col_tv_device      = find_col(raw, ["tvdevice"])
-    col_mobile_device  = find_col(raw, ["mobiledevice"])
-    col_pos            = find_col(raw, ["pos", "pos_name", "shop", "store"])
-    col_tariff         = find_col(raw, ["log_tariffname", "tariff", "tarifa", "naziv_tarife", "plan", "paket"])
-    col_start          = find_col(raw, ["start"])
-    col_contract_type  = find_col(raw, ["contracttype"])
-
-    df = raw.copy()
-    df["_start_dt"] = df[col_start].apply(parse_excel_datetime) if col_start in df.columns else pd.NaT
-    df["_is_business"] = (
-        df[col_contract_type].astype(str).str.strip().str.upper().eq("BUSINESS")
-        if col_contract_type in df.columns else False
-    )
-    df["_mobile"]     = df[col_mobile].map(truthy) if col_mobile in df.columns else False
-    df["_tv"]         = df[col_tv].map(truthy) if col_tv in df.columns else False
-    df["_price_tv"]   = df[col_price_tv].map(has_value) if col_price_tv in df.columns else False
-    df["_inet_modem"] = df[col_inet_dev].astype(str).str.strip().str.upper().eq("MODEM") if col_inet_dev in df.columns else False
-    df["_services"]   = df.apply(services_for_row, axis=1)
-    df["POS_TIP"]     = df[col_pos].apply(map_pos_tip) if col_pos in df.columns else "MULTIBREND"
-    df["POS_TIP_BUS"] = np.where(df["_is_business"], "BUSINESS", df["POS_TIP"])
-
-    # NOVI vs PRODUŽENJE
-    if mode == "Analiza pojedinačnog fajla":
-        fname = str(df["__file__"].iloc[0]) if "__file__" in df.columns else ""
-        y_hint, m_hint = derive_period_from_filename(fname)
-        if not (y_hint and m_hint):
-            counts = df["_start_dt"].dropna().dt.to_period("M").value_counts()
-            if len(counts) > 0:
-                per = counts.index[0]
-                y_hint, m_hint = per.year, per.month
-            else:
-                now = datetime.now()
-                y_hint, m_hint = now.year, now.month
-        df["CONTRACT_TIP"] = np.where(
-            (df["_start_dt"].dt.year == y_hint) & (df["_start_dt"].dt.month == m_hint),
-            "NOVI", "PRODUŽENJE"
-        )
-    else:
-        def _infer_contract_tip(row):
-            m = re.search(r"(20\d{2})_(0[1-9]|1[0-2])", str(row.get("__file__", "")))
-            if m and not pd.isna(row.get("_start_dt", pd.NaT)):
-                y, mo = int(m.group(1)), int(m.group(2))
-                return "NOVI" if (row["_start_dt"].year == y and row["_start_dt"].month == mo) else "PRODUŽENJE"
-            return "PRODUŽENJE"
-        df["CONTRACT_TIP"] = df.apply(_infer_contract_tip, axis=1)
-
-    # =========================
-    #   KPI + TABELE
-    # =========================
-    long_all = df[["CONTRACT_TIP", "POS_TIP_BUS", "_services"]].explode("_services").dropna()
-
-    svc_counts   = long_all["_services"].value_counts().to_dict()
-    mobile_cnt   = int(svc_counts.get("MOBILE", 0))
-    tv_cnt       = int(svc_counts.get("TV", 0))
-    internet_cnt = int(svc_counts.get("INTERNET", 0))
-    tvgo_cnt     = int(svc_counts.get("TV GO", 0))
-    phones_cnt   = int(df[find_col(raw, ["mobiledevice"])].notna().sum()) if find_col(raw, ["mobiledevice"]) in df.columns else 0
-    biz_cnt      = int(df["_is_business"].sum())
-
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
-    with k1: st.metric("📱 MOBILE", mobile_cnt)
-    with k2: st.metric("📺 TV", tv_cnt)
-    with k3: st.metric("🌐 INTERNET", internet_cnt)
-    with k4: st.metric("📲 TV GO", tvgo_cnt)
-    with k5: st.metric("📦 Telefoni", phones_cnt)
-    with k6: st.metric("🏢 BUSINESS", biz_cnt)
-
-    st.divider()
-    st.subheader("Ugovori po usluzi × tip (NOVI / PRODUŽENJE)")
-    svc_tip = (
-        long_all.groupby(["_services", "CONTRACT_TIP"])
-            .size().reset_index(name="broj")
-            .pivot(index="_services", columns="CONTRACT_TIP", values="broj")
-            .fillna(0).astype(int)
-    )
-    st.dataframe(with_totals_pivot(svc_tip), use_container_width=True)
-
-    # TARIFE (MOBILE/TV/INTERNET), TV uz internet -> STARNET
-    st.divider()
-    st.subheader("Prodaja tarifa (MOBILE / TV / INTERNET)")
-    col_tariff = find_col(raw, ["log_tariffname", "tariff", "tarifa", "naziv_tarife", "plan", "paket"])
-    if col_tariff in df.columns:
-        records = []
-        for _, r in df.iterrows():
-            tname = r[col_tariff]
-            if r["_mobile"]:
-                records.append(("MOBILE", tname))
-            if r["_tv"]:
-                records.append(("TV", tname))
-            if r["_inet_modem"]:
-                records.append(("INTERNET", tname))
-                if r["_price_tv"]:
-                    records.append(("TV", "STARNET"))  # TV uz internet -> STARNET
-        tariffs_long = pd.DataFrame(records, columns=["_services", "tarifa"])
-        tariffs_long = tariffs_long[tariffs_long["_services"].isin(["MOBILE", "TV", "INTERNET"])]
-        sales_by_tariff = (
-            tariffs_long.groupby(["_services", "tarifa"]).size().reset_index(name="broj")
-            .sort_values(["_services", "broj"], ascending=[True, False])
-        )
-        tabs = st.tabs(["MOBILE", "TV", "INTERNET"])
-        for svc, tab in zip(["MOBILE", "TV", "INTERNET"], tabs):
-            with tab:
-                tdf = sales_by_tariff[sales_by_tariff["_services"] == svc].drop(columns=["_services"]).reset_index(drop=True)
-                st.dataframe(with_total_row(tdf, value_col="broj", label_col="tarifa"), use_container_width=True)
-    else:
-        st.info("Nema kolone sa tarifama (H).")
-
-    # TELEFONI po POS
-    st.divider()
-    st.subheader("Prodaja telefona po POS tipu (MobileDevice × POS)")
-    col_mobile_device_found = find_col(raw, ["mobiledevice"])
-    if col_mobile_device_found and col_mobile_device_found in df.columns:
-        phones = (
-            df.dropna(subset=[col_mobile_device_found])
-              .groupby([col_mobile_device_found, "POS_TIP_BUS"])
-              .size().reset_index(name="broj")
-        )
-        phones_pivot = phones.pivot(index=col_mobile_device_found, columns="POS_TIP_BUS", values="broj").fillna(0).astype(int)
-        st.dataframe(with_totals_pivot(phones_pivot), use_container_width=True)
-    else:
-        st.info("Kolona MobileDevice (AA) nije pronađena.")
-
-    # STB (STB/STB2) po POS
-    st.divider()
-    st.subheader("STB uređaji po POS tipu (STB/STB2)")
-    col_tv_device = find_col(raw, ["tvdevice"])
-    if col_tv_device and col_tv_device in df.columns:
-        df["_tvdev"] = df[col_tv_device].astype(str).str.upper().str.strip()
-        stb_df = df[df["_tvdev"].isin(["STB", "STB2"])]
-        stb = stb_df.groupby(["_tvdev", "POS_TIP_BUS"]).size().reset_index(name="broj")
-        stb_pivot = stb.pivot(index="_tvdev", columns="POS_TIP_BUS", values="broj").fillna(0).astype(int)
-        st.dataframe(with_totals_pivot(stb_pivot), use_container_width=True)
-    else:
-        st.info("Kolona TVDevice (AD) nije pronađena.")
-
-    # POS × USLUGA (ukupno — uključuje BUSINESS)
-    st.divider()
-    st.subheader("Prodaja po POS tipu (MOBILE, TV, INTERNET, TV GO) — uključuje BUSINESS")
-    pos_pivot_all = (
-        long_all.groupby(["POS_TIP_BUS", "_services"]).size().reset_index(name="broj")
-           .pivot(index="POS_TIP_BUS", columns="_services", values="broj")
-           .fillna(0).astype(int)
-    )
-    for c in ["MOBILE", "TV", "INTERNET", "TV GO"]:
-        if c not in pos_pivot_all.columns:
-            pos_pivot_all[c] = 0
-    pos_pivot_all = pos_pivot_all[["MOBILE", "TV", "INTERNET", "TV GO"]]
-    st.dataframe(with_totals_pivot(pos_pivot_all), use_container_width=True)
-
-    # POS × USLUGA — BUSINESS
-    st.divider()
-    st.subheader("Prodaja po POS tipu — samo BUSINESS ugovori")
-    df_bus = df[df["_is_business"]].copy()
-    if df_bus.empty:
-        st.info("Nema BUSINESS ugovora u odabranom periodu.")
-    else:
-        long_bus = df_bus[["_services", "POS_TIP"]].explode("_services").dropna()
-        pos_bus_pivot = (
-            long_bus.groupby(["POS_TIP", "_services"]).size().reset_index(name="broj")
-                    .pivot(index="POS_TIP", columns="_services", values="broj")
-                    .fillna(0).astype(int)
-        )
-        for c in ["MOBILE", "TV", "INTERNET", "TV GO"]:
-            if c not in pos_bus_pivot.columns:
-                pos_bus_pivot[c] = 0
-        pos_bus_pivot = pos_bus_pivot[["MOBILE", "TV", "INTERNET", "TV GO"]]
-        st.dataframe(with_totals_pivot(pos_bus_pivot), use_container_width=True)
-
-    # POS × USLUGA — REZIDENCIJALA
-    st.subheader("Prodaja po POS tipu — REZIDENCIJALA (bez BUSINESS)")
-    df_res = df[~df["_is_business"]].copy()
-    if df_res.empty:
-        st.info("Nema REZIDENCIJALNIH ugovora u odabranom periodu.")
-    else:
-        long_res = df_res[["_services", "POS_TIP"]].explode("_services").dropna()
-        pos_res_pivot = (
-            long_res.groupby(["POS_TIP", "_services"]).size().reset_index(name="broj")
-                    .pivot(index="POS_TIP", columns="_services", values="broj")
-                    .fillna(0).astype(int)
-        )
-        for c in ["MOBILE", "TV", "INTERNET", "TV GO"]:
-            if c not in pos_res_pivot.columns:
-                pos_res_pivot[c] = 0
-        pos_res_pivot = pos_res_pivot[["MOBILE", "TV", "INTERNET", "TV GO"]]
-        st.dataframe(with_totals_pivot(pos_res_pivot), use_container_width=True)
-
-    # TRENDS (više fajlova) — samo NOVI
-    if mode == "Analiza perioda (više fajlova)":
-        st.divider()
-        st.subheader("📈 Trend po mjesecima – samo NOVI (MOBILE / TV / INTERNET / TV GO)")
-        df_novi = df[df["CONTRACT_TIP"] == "NOVI"].copy()
-        df_novi["YEAR_MONTH"] = df_novi["__file__"].str.extract(r"(20\d{2})_(0[1-9]|1[0-2])").agg("_".join, axis=1)
-        long_m = df_novi[["YEAR_MONTH", "_services"]].explode("_services").dropna()
-        monthly = (
-            long_m.groupby(["YEAR_MONTH", "_services"]).size().reset_index(name="broj")
-                  .pivot(index="YEAR_MONTH", columns="_services", values="broj")
-                  .fillna(0).astype(int).sort_index()
-        )
-        for c in ["MOBILE", "TV", "INTERNET", "TV GO"]:
-            if c not in monthly.columns:
-                monthly[c] = 0
-        monthly = monthly[["MOBILE", "TV", "INTERNET", "TV GO"]]
-
-        _monthly = monthly.copy()
-        try:
-            _monthly.index = pd.to_datetime(_monthly.index.str.replace("_", "-") + "-01", format="%Y-%m-%d")
-        except Exception:
-            pass
-        fig1, ax1 = plt.subplots()
-        _monthly.plot(ax=ax1)
-        ax1.set_title("Trend po mjesecima – samo NOVI (MOBILE/TV/INTERNET/TV GO)")
-        ax1.set_xlabel("Mjesec")
-        ax1.set_ylabel("Broj ugovora (NOVI)")
-        ax1.grid(True, which="both", axis="both", linestyle="--", linewidth=0.5)
-        fig1.autofmt_xdate()
-        st.pyplot(fig1, use_container_width=True)
-
-        st.subheader("📈 Ukupno po mjesecima – samo NOVI")
-        monthly_total = monthly.sum(axis=1).to_frame(name="UKUPNO").sort_index()
-        _monthly_total = monthly_total.copy()
-        try:
-            _monthly_total.index = pd.to_datetime(_monthly_total.index.str.replace("_", "-") + "-01", format="%Y-%m-%d")
-        except Exception:
-            pass
-        fig2, ax2 = plt.subplots()
-        _monthly_total.plot(ax=ax2)
-        ax2.set_title("Ukupno po mjesecima – samo NOVI")
-        ax2.set_xlabel("Mjesec")
-        ax2.set_ylabel("Broj ugovora (NOVI)")
-        ax2.grid(True, which="both", axis="both", linestyle="--", linewidth=0.5)
-        fig2.autofmt_xdate()
-        st.pyplot(fig2, use_container_width=True)
-
-        st.subheader("📊 Trend po kvartalima – samo NOVI")
-        df_novi["_QTR"] = df_novi["_start_dt"].dt.to_period("Q").astype(str)
-        long_q = df_novi[["_QTR", "_services"]].explode("_services").dropna()
-        quarterly = (
-            long_q.groupby(["_QTR", "_services"]).size().reset_index(name="broj")
-                  .pivot(index="_QTR", columns="_services", values="broj")
-                  .fillna(0).astype(int).sort_index()
-        )
-        for c in ["MOBILE", "TV", "INTERNET", "TV GO"]:
-            if c not in quarterly.columns:
-                quarterly[c] = 0
-        quarterly = quarterly[["MOBILE", "TV", "INTERNET", "TV GO"]]
-        quarterly = quarterly.loc[quarterly.sum(axis=1) > 0]
-
-        available_services = [c for c in ["MOBILE", "TV", "INTERNET", "TV GO"] if quarterly[c].sum() > 0]
-        selected_services = st.multiselect(
-            "Prikaži usluge na kvartalnom grafikonu",
-            options=available_services,
-            default=available_services,
-        )
-        show_values = st.checkbox("Prikaži vrijednosti na tačkama (kvartali)", value=True)
-
-        q_plot = quarterly.copy()
-        try:
-            q_plot.index = pd.PeriodIndex(q_plot.index, freq="Q").to_timestamp(how="start")
-        except Exception:
-            pass
-
-        if selected_services:
-            figq, axq = plt.subplots()
-            q_plot[selected_services].plot(ax=axq)
-            axq.set_title("Trend po kvartalima – samo NOVI")
-            axq.set_xlabel("Kvartal")
-            axq.set_ylabel("Broj ugovora (NOVI)")
-            axq.grid(True, which="both", axis="both", linestyle="--", linewidth=0.5)
-            figq.autofmt_xdate()
-            if show_values:
-                for col in selected_services:
-                    for x, y in zip(q_plot.index, q_plot[col].values):
-                        axq.annotate(f"{int(y)}", (x, y), textcoords="offset points",
-                                     xytext=(0, 4), ha="center", fontsize=8)
-            st.pyplot(figq, use_container_width=True)
-        else:
-            st.info("Odaberi najmanje jednu uslugu za prikaz.")
-
-        st.subheader("📊 Ukupno po kvartalima – samo NOVI")
-        q_total = quarterly.sum(axis=1).to_frame(name="UKUPNO")
-        q_total_plot = q_total.copy()
-        try:
-            q_total_plot.index = pd.PeriodIndex(q_total_plot.index, freq="Q").to_timestamp(how="start")
-        except Exception:
-            pass
-        figqt, axqt = plt.subplots()
-        q_total_plot.plot(ax=axqt)
-        axqt.set_title("Ukupno po kvartalima – samo NOVI")
-        axqt.set_xlabel("Kvartal")
-        axqt.set_ylabel("Broj ugovora (NOVI)")
-        axqt.grid(True, which="both", axis="both", linestyle="--", linewidth=0.5)
-        figqt.autofmt_xdate()
-        if show_values:
-            for x, y in zip(q_total_plot.index, q_total_plot["UKUPNO"].values):
-                axqt.annotate(f"{int(y)}", (x, y), textcoords="offset points",
-                              xytext=(0, 4), ha="center", fontsize=8)
-        st.pyplot(figqt, use_container_width=True)
-
-# ===== Uporedna analiza (2 mjeseca) — poseban ekran =====
-if mode == "Uporedna analiza (2 mjeseca)":
-    st.header("🔁 Uporedna analiza (2 mjeseca)")
-    if USE_GDRIVE:
-        compare_names = gdrive_list_reports()
-    if not compare_names:
-        st.info("Nema mjesečnih fajlova.")
+    names = gdrive_list_reports()
+    if not names:
+        st.warning("Nema fajlova na Google Drive-u.")
         st.stop()
 
-    rx = re.compile(r"^ALL_CONTRACT_(20\d{2})_(0[1-9]|1[0-2])\.xlsx$")
-    month_keys = []
-    for f in compare_names:
-        m = rx.match(f)
-        y, mo = int(m.group(1)), int(m.group(2))
-        month_keys.append((y, mo, f))
-    month_keys.sort()
-    labels = [f"{y}-{mo:02d}" for (y, mo, f) in month_keys]
-
-    idx_old = st.sidebar.selectbox("Stariji mjesec", list(range(len(labels))), format_func=lambda i: labels[i],
-                                   index=max(0, len(labels)-2), key="cmp_old_top")
-    idx_new = st.sidebar.selectbox("Noviji mjesec", list(range(len(labels))), format_func=lambda i: labels[i],
-                                   index=len(labels)-1, key="cmp_new_top")
-    if idx_old == idx_new:
-        st.warning("Odaberi dva različita mjeseca u lijevom meniju.")
-        st.stop()
-
-    name_old = month_keys[idx_old][2]
-    name_new = month_keys[idx_new][2]
-
-    raw_old = load_one_excel(gdrive_read_file_bytes(name_old), name_old)
-    raw_new = load_one_excel(gdrive_read_file_bytes(name_new), name_new)
-
-    df_old = preprocess_month_df(raw_old)
-    df_new = preprocess_month_df(raw_new)
-
-    bus_old, res_old = pos_pivot_by_business(df_old)
-    bus_new, res_new = pos_pivot_by_business(df_new)
-
-    bus_pct = pct_change_table(bus_new, bus_old)
-    res_pct = pct_change_table(res_new, res_old)
-
-    st.subheader("🏠 Rezidencijala — Prodaja po POS (stari vs. novi)")
-    c1, c2 = st.columns(2)
+    c1,c2 = st.columns(2)
     with c1:
-        st.markdown(f"**{labels[idx_old]} — REZIDENCIJALA**")
-        st.dataframe(with_totals_pivot(res_old), use_container_width=True)
+        a_name = st.selectbox("Noviji mjesec", names, index=len(names)-1)
     with c2:
-        st.markdown(f"**{labels[idx_new]} — REZIDENCIJALA**")
-        st.dataframe(with_totals_pivot(res_new), use_container_width=True)
-    st.markdown("**Δ% (novi vs. stari) — REZIDENCIJALA**  \n*(∞ znači da u starom nije bilo prodaje, a u novom ima)*")
-    st.dataframe(res_pct.replace(np.inf, "∞"), use_container_width=True)
+        b_name = st.selectbox("Stariji mjesec", names, index=max(0, len(names)-2))
 
-    st.subheader("🏢 Business — Prodaja po POS (stari vs. novi)")
-    c3, c4 = st.columns(2)
-    with c3:
-        st.markdown(f"**{labels[idx_old]} — BUSINESS**")
-        st.dataframe(with_totals_pivot(bus_old), use_container_width=True)
-    with c4:
-        st.markdown(f"**{labels[idx_new]} — BUSINESS**")
-        st.dataframe(with_totals_pivot(bus_new), use_container_width=True)
-    st.markdown("**Δ% (novi vs. stari) — BUSINESS**  \n*(∞ znači da u starom nije bilo prodaje, a u novom ima)*")
-    st.dataframe(bus_pct.replace(np.inf, "∞"), use_container_width=True)
+    if a_name and b_name:
+        da = load_from_gdrive(a_name)
+        db = load_from_gdrive(b_name)
 
-    st.subheader("📊 Ukupan procenat razlike po uslugama (novi vs. stari)")
-    old_totals = (res_old.sum(axis=0) + bus_old.sum(axis=0)).reindex(["MOBILE", "TV", "INTERNET", "TV GO"]).fillna(0).astype(int)
-    new_totals = (res_new.sum(axis=0) + bus_new.sum(axis=0)).reindex(["MOBILE", "TV", "INTERNET", "TV GO"]).fillna(0).astype(int)
-    diff_tot   = new_totals - old_totals
-    with np.errstate(divide="ignore", invalid="ignore"):
-        pct_values = (diff_tot / old_totals.replace(0, np.nan) * 100).round(1)
+        da_new = only_new(da)
+        db_new = only_new(db)
 
-    def fmt_pct(name):
-        old_v = old_totals[name]
-        new_v = new_totals[name]
-        if old_v == 0 and new_v > 0:
-            return "∞"
-        val = pct_values[name]
-        if pd.isna(val):
-            return "0.0%"
-        return f"{val:.1f}%"
+        M_a, T_a, I_a, TG_a, PH_a = kpi_counts(da_new)
+        M_b, T_b, I_b, TG_b, PH_b = kpi_counts(db_new)
 
-    summary = pd.DataFrame({
-        "STARI": old_totals,
-        "NOVI":  new_totals,
-        "Δ":     diff_tot,
-        "Δ%":    [fmt_pct(s) for s in ["MOBILE", "TV", "INTERNET", "TV GO"]]
-    }, index=["MOBILE", "TV", "INTERNET", "TV GO"])
-    st.dataframe(summary, use_container_width=True)
+        st.markdown("#### KPI — Novi ugovori")
+        ka,kb,kc,kd,ke = st.columns(5)
+        ka.metric(f"MOBILE ({a_name})", M_a, f"{M_a - M_b:+}")
+        kb.metric(f"TV ({a_name})", T_a, f"{T_a - T_b:+}")
+        kc.metric(f"INTERNET ({a_name})", I_a, f"{I_a - I_b:+}")
+        kd.metric(f"TV GO ({a_name})", TG_a, f"{TG_a - TG_b:+}")
+        ke.metric(f"Telefoni ({a_name})", PH_a, f"{PH_a - PH_b:+}")
 
-    st.stop()
+        st.markdown("---")
+        st.markdown("### REZIDENCIJALA — po POS tipu")
+        resA, resB, busA, busB = compare_two(da, db)
+        resid_diff = diff_with_pct(resA, resB, label_new=a_name, label_old=b_name)
+        st.dataframe(resid_diff)
 
-st.caption("© Izvještaj generisan prema poslovnim pravilima i podacima iz odabranih Excel fajlova. • Razvijeno od strane *gennaro*")
+        st.markdown("### BUSINESS — po POS tipu")
+        bus_diff = diff_with_pct(busA, busB, label_new=a_name, label_old=b_name)
+        st.dataframe(bus_diff)
+
+# ---------------------------
+# Footer
+# ---------------------------
+st.markdown("---")
+st.caption("© Izvještaj generisan prema poslovnim pravilima klijenta. Razvijeno od strane *gennaro*.")

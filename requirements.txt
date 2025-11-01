@@ -4,3 +4,4 @@ numpy
 openpyxl
 matplotlib
 pydrive2
+xlsx2csv

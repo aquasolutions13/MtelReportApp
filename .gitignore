@@ -7,3 +7,4 @@ __pycache__/
 *.xlsx
 *.csv
 *.log
+!data/*.xlsx

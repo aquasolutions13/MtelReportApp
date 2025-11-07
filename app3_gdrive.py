@@ -133,6 +133,7 @@ def map_pos_tip(pos_val: str) -> str:
     if "WMH" in su: return "WMH"
     if "WTH" in su: return "WTH"
     if "WDZ" in su: return "WDZ"
+    if "WJH" in su: return "WJH"    
     if "HARTLAUER" in su: return "HARTLAUER"
     if "WEB" in su: return "WEB"
     if "TELESALES" in su: return "TELESALES"
